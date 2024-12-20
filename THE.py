@@ -6,7 +6,7 @@ from scipy.sparse import lil_matrix
 from scipy.sparse.linalg import spsolve
 import scipy.sparse.csgraph
 from scipy.optimize import curve_fit
-
+from scipy.sparse import csr_matrix
 
 class Problem():
     def __init__(self, n_elements, dimension):
@@ -14,8 +14,8 @@ class Problem():
         self.dimension = dimension
         self.matrix, self.rhs = self.build_matrix_and_rhs(n_elements, dimension)
         self.reordered_matrix = self.reorder()
-        self.cholesky_factor, self.cholesky_time = self.cholesky(self.matrix)
-        self.cholesky_factor_reorderd, self.cholesky_time_reordered = self.cholesky(self.reordered_matrix)
+        #self.cholesky_factor, self.cholesky_time = self.cholesky(self.matrix)
+        #self.cholesky_factor_reorderd, self.cholesky_time_reordered = self.cholesky(self.reordered_matrix)
 
     def build_matrix_and_rhs(self, n_elements, dimension):
         spacing = 1.0 / (n_elements + 1)
@@ -205,25 +205,27 @@ class Problem():
             x[i] = (y[i] - np.dot(L_T[i, i + 1:], x[i + 1:])) / L_T[i, i]
         return x
 
-    def solve_cholesky(self):
+    def solve_cholesky(self, cholesky_factor):
         """Solve Ax = b using the Cholesky decomposition."""
         time_start = time.perf_counter()
-        y = self.forward_substitution(self.cholesky_factor, self.rhs)
+        y = self.forward_substitution(cholesky_factor, self.rhs)
         time_forward_solve = time.perf_counter() - time_start
 
         time_start = time.perf_counter()
-        x = self.backward_substitution(self.cholesky_factor.T, y)
+        x = self.backward_substitution(cholesky_factor.T, y)
         time_backward_solve = time.perf_counter() - time_start
 
         return x, time_forward_solve, time_backward_solve
 
     def fill_in_ratio(self, reorder=False):
         if reorder:
+            cholesky_factor, _ = self.cholesky(self.reordered_matrix)
             nnz_A = self.reordered_matrix.nnz
-            nnz_C = self.reordered_matrix.nnz
+            nnz_C = np.count_nonzero(cholesky_factor)
         else:
+            cholesky_factor, _ = self.cholesky(self.matrix)
             nnz_A = self.matrix.nnz
-            nnz_C = np.count_nonzero(self.cholesky_factor)
+            nnz_C = np.count_nonzero(cholesky_factor)
 
         return nnz_C / nnz_A
 
@@ -231,53 +233,116 @@ class Problem():
         rcm_order = scipy.sparse.csgraph.reverse_cuthill_mckee(self.matrix)
         return self.matrix[rcm_order, :][:, rcm_order]
 
-    def ssor(self, x0=None, omega = 1.5, tol=1e-8, max_iter=1000):
-        """
-        Solve Ax = b using the SSOR method as a BIM.
+    def ssor_step(self,A,rhs, length_rhs, x, omega):
+        # Forward sweep
+        for i in range(length_rhs):
+            sigma = x[i].copy()
+            x[i] = (rhs[i] - A[i, :i] @ x[:i] - A[i, i+1:] @ x[i+1:]) / A[i, i]
+            x[i] = (1 - omega) * sigma + omega * x[i]
 
-        Parameters:
-            x0 (ndarray, optional): Initial guess for the solution
-            tol (float, optional): Tolerance for stopping criterion
-            max_iter (int, optional): Maximum number of iterations
+        # Backward sweep
+        for i in reversed(range(length_rhs)):
+            sigma = x[i].copy()
+            x[i] = (rhs[i] - A[i, :i] @ x[:i] - A[i, i+1:] @ x[i+1:]) / A[i, i]
+            x[i] = (1 - omega) * sigma + omega * x[i]
+        
+        return x
 
-        Returns:
-            x (ndarray): Solution vector
-            residuals (list): List of residual norms at each iteration
-        """
+    def ssor(self, x0=None, omega=1.5, tol=1e-10, max_iter=1000):
         n = len(self.rhs)
         if x0 is None:
             x = np.zeros(n)
         else:
-            x = x0
+            x = x0.copy()
 
-        D = np.diag(np.diag(self.A))
-        L = np.tril(self.A, -1)
-        U = np.triu(self.A, 1)
+        A = self.matrix.todense()
 
-        residuals = []
+        residuals = [np.linalg.norm(self.rhs - A @ x) / np.linalg.norm(self.rhs)]
         for k in range(max_iter):
-            # Forward sweep
-            for i in range(n):
-                sum1 = np.dot(self.A[i, :i], x[:i])
-                sum2 = np.dot(self.A[i, i + 1:], x[i + 1:])
-                x[i] = (1 - omega) * x[i] + (omega / self.A[i, i]) * (self.rhs[i] - sum1 - sum2)
 
-            # Backward sweep
-            for i in range(n - 1, -1, -1):
-                sum1 = np.dot(self.A[i, :i], x[:i])
-                sum2 = np.dot(self.A[i, i + 1:], x[i + 1:])
-                x[i] = (1 - omega) * x[i] + (omega / self.A[i, i]) * (self.rhs[i] - sum1 - sum2)
+            x = self.ssor_step(A, self.rhs, n, x, omega)
 
-            # Compute residual
-            residual = np.linalg.norm(self.rhs - np.dot(self.A, x))
+            residual = np.linalg.norm(self.rhs - A @ x) / np.linalg.norm(self.rhs)
             residuals.append(residual)
-
-            # Check for convergence
             if residual < tol:
                 break
 
         return x, residuals
 
+    def cg_ssor_step(self, Diagonal, Diag_omegaE, Diag_omegaF, x, residual, direction, omega = 1.5):
+        
+        #M_SSOR = Diag_omegaE @ np.diag(1 / np.diag(Diagonal)) @ Diag_omegaF
+
+        #Forward solve
+        y = self.forward_substitution(Diag_omegaE, residual)
+        #Diagonal scaling
+        w = y / np.diag(Diagonal)
+        #Backward solve
+
+        z = self.backward_substitution(Diag_omegaF, w)
+
+        #Compute step size
+        helper = np.dot(direction, self.matrix @ direction)
+
+        if helper == 0:
+            alpha = 1
+        else:
+            alpha = np.dot(residual.T, z) / helper
+
+        #Update x
+        x = x + alpha * direction
+
+        #Update residual
+        residual_new = residual - alpha * self.matrix @ direction
+
+        #Forward solve
+        y = self.forward_substitution(Diag_omegaE, residual_new)
+        #Diagonal scaling
+        w = y / np.diag(Diagonal)
+        #Backward solve
+        z_new = self.backward_substitution(Diag_omegaF, w)
+
+        #Compute beta
+        beta = np.dot(residual_new.T, z_new) / np.dot(residual.T, z)
+
+        #Update direction
+        direction = z_new + beta * direction
+
+
+        return x, residual_new, direction
+
+    def cg_with_ssor(self, tol=1e-10, max_iter=1000, omega =1.5):
+
+        Residuals = []
+
+        Diagonal = np.diag(np.diag(self.matrix.todense()))
+        E = -np.tril(self.matrix.todense(), -1)
+        F = -np.triu(self.matrix.todense(), 1)
+
+        Residuals.append(np.linalg.norm(self.rhs - self.matrix @ np.zeros(len(self.rhs))) / np.linalg.norm(self.rhs))
+
+        x = np.zeros_like(self.rhs)
+        r = self.rhs - self.matrix @ x  
+        
+        y = self.forward_substitution((Diagonal + omega*E), r)
+        w = y / np.diag(Diagonal)
+        z = self.backward_substitution((Diagonal + omega*F).T, w)
+
+        direction = z.copy()
+        Residuals = [np.linalg.norm(r)/np.linalg.norm(self.rhs)]
+
+
+        #x, r, direction = self.cg_ssor_step(Diagonal, E, F, np.zeros(len(self.rhs)), self.rhs/np.linalg.norm(self.rhs), np.zeros(len(self.rhs)))
+        Diag_omegaE = np.diag(np.diag(self.matrix.todense())) + omega * np.tril(self.matrix.todense(), -1)
+        Diag_omegaF = np.diag(np.diag(self.matrix.todense())) + omega * np.triu(self.matrix.todense(), 1)
+
+        for i in range(max_iter):
+            x, r, direction = self.cg_ssor_step(Diagonal, Diag_omegaE, Diag_omegaF, x, r, direction)
+            Residuals.append(np.linalg.norm(r) / np.linalg.norm(self.rhs))
+            if np.linalg.norm(r) < tol:
+                break
+        
+        return x, Residuals
 
 def compare_methods():
     p_values = range(2, 11)
@@ -285,11 +350,16 @@ def compare_methods():
         n_elements = 2 * p - 1
         problem = Problem(n_elements, 3)
         u_exact = problem.exact_solution(n_elements)
-        u_h_cholesky = problem.solve_cholesky()[0]
+        cho_fac, _ = problem.cholesky(problem.matrix)
+        u_h_cholesky = problem.solve_cholesky(cho_fac)[0]
+        u_h_ssor,_ = problem.ssor()
+        u_h_cg, _ = problem.cg_with_ssor()
         u_h_spsolve = spsolve(problem.matrix, problem.rhs)
         error_cholesky = np.max(np.abs(u_h_cholesky - u_exact))
         error_spsolve = np.max(np.abs(u_h_spsolve - u_exact))
-        print(f"p = {p}, Error (Cholesky): {error_cholesky}, Error (spsolve): {error_spsolve}")
+        error_ssor = np.max(np.abs(u_h_ssor- u_exact))
+        error_cg = np.max(np.abs(u_h_cg - u_exact))
+        print(f"p = {p}, Error (Cholesky): {error_cholesky}, Error (spsolve): {error_spsolve}, Error (ssor): {error_ssor}, Error (CG): {error_cg}")
 
 def check_SPD(p=5):
     n_elements = 2 * p - 1
@@ -354,9 +424,9 @@ def E3(dimension=2, reorder=False):
         problem = Problem(n_elements, 3)
         if reorder:
             problem.matrix = problem.reordered_matrix
-        _, cholesky_time = problem.cholesky(problem.matrix)
+        chol_fac, cholesky_time = problem.cholesky(problem.matrix)
         cholesky_times.append(cholesky_time)
-        _, forward_solve_time, backward_solve_time = problem.solve_cholesky()
+        _, forward_solve_time, backward_solve_time = problem.solve_cholesky(chol_fac)
         forward_solve_times.append(forward_solve_time)
         backward_solve_times.append(backward_solve_time)
 
@@ -423,9 +493,9 @@ def E3(dimension=2, reorder=False):
 
 def E4(dimension=2, reorder=False):
     if dimension == 2:
-        p_values = range(2, 11)
+        p_values = range(2, 30)
     elif dimension == 3:
-        p_values = range(2, 9)
+        p_values = range(2, 15)
     else:
         print("Wrong Dimension")
         return
@@ -439,8 +509,20 @@ def E4(dimension=2, reorder=False):
         problem_size.append(n_elements**dimension)
         fill_in_ratios.append(fill_in_ratio)
 
+    if dimension == 2:
+        def fill_in(n, a, b, c):
+            return a * n**0.5 + b * n + c
+    elif dimension == 3:
+        def fill_in(n, a, b, c):
+            return a * n**(1/3) + b * n + c
+    
+    
+    popt, _ = curve_fit(fill_in, problem_size, fill_in_ratios)
+    print("a, b, c:", popt)
 
+    plt.plot(problem_size, [fill_in(n, *popt) for n in problem_size], '--', label="Fit")
     plt.plot(problem_size, fill_in_ratios, '-o')
+    plt.legend(["Fit", "Measured"])
     plt.xlabel("Problem Size N (Number of Elements)")
     plt.ylabel("Fill-in Ratio")
     if reorder:
@@ -449,11 +531,284 @@ def E4(dimension=2, reorder=False):
         plt.savefig(f"4/E4_p_{p_values[-1]}_{dimension}.png")
     plt.clf()
 
+def E5(dimension=2, a=False, b=False):
+    if a:
+        
+        if dimension == 2:
+            p_values = range(2, 11)
+        elif dimension == 3:
+            p_values = range(2, 9)
+        else:
+            print("Wrong Dimension")
+            return
+        cholesky_times = []
+        backward_solve_times = []
+        forward_solve_times = []
+
+        cholesky_times_reorderd = []
+        backward_solve_times_reorderd = []
+        forward_solve_times_reorderd = []
+
+        n = []
+        for p in p_values:
+            n_elements = 2 * p - 1
+            n.append(n_elements**dimension)
+            problem = Problem(n_elements, 3)
+
+            chol_fac, cholesky_time = problem.cholesky(problem.matrix)
+            _, forward_solve_time, backward_solve_time = problem.solve_cholesky(chol_fac)
+            forward_solve_times.append(forward_solve_time)
+            backward_solve_times.append(backward_solve_time)
+            cholesky_times.append(cholesky_time)
+            
+            
+            chol_fac_r, cholesky_time_reo = problem.cholesky(problem.reordered_matrix)
+            _, forward_solve_time_reo, backward_solve_time_reo = problem.solve_cholesky(chol_fac_r)
+            forward_solve_times_reorderd.append(forward_solve_time_reo)
+            backward_solve_times_reorderd.append(backward_solve_time_reo)
+            cholesky_times_reorderd.append(cholesky_time_reo)
+        
+        theoretical_times_chol = [(n_i**3 + n_i)*(cholesky_times[0]/(n[0]**3 + n[0])) for n_i in n]
+
+        # Plot the results
+        plt.semilogy(n, theoretical_times_chol, '--', label="Theoretical")
+        plt.semilogy(n, cholesky_times, '-o', label="Cholesky (Measured)")
+        plt.semilogy(n, cholesky_times_reorderd, '-o', label="Cholesky (Measured) Reordered")
+        plt.xlabel("Problem Size (N)")
+        plt.ylabel("Time (seconds)")
+        plt.legend()
+        plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+        plt.savefig(f"5/E5_p_{p_values[-1]}_{dimension}_Cholesky.png")
+        plt.clf()
+
+        theoretical_times = [(n_i**2 + n_i)*(forward_solve_times[0]/(n[0]**2 + n[0])) for n_i in n]
+
+        # Plot the results
+        plt.semilogy(n, theoretical_times, '--', label="Theoretical")
+        plt.semilogy(n, forward_solve_times, '-o', label="forward solve (Measured)")
+        plt.semilogy(n, forward_solve_times_reorderd, '-o', label="forward solve (Measured) Reordered")
+        plt.xlabel("Problem Size (N)")
+        plt.ylabel("Time (seconds)")
+        plt.legend()
+        plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+        plt.savefig(f"5/E5_p_{p_values[-1]}_{dimension}_Forward.png")
+        plt.clf()
+
+        theoretical_times = [(n_i**2 + n_i)*(backward_solve_times[0]/(n[0]**2 + n[0])) for n_i in n]
+
+        # Plot the results
+        plt.semilogy(n, theoretical_times, '--', label="Theoretical")
+        plt.semilogy(n, backward_solve_times, '-o', label="backward solve (Measured)")
+        plt.semilogy(n, backward_solve_times_reorderd, '-o', label="backward solve (Measured) Reordered")
+        plt.xlabel("Problem Size (N)")
+        plt.ylabel("Time (seconds)")
+        plt.legend()
+        plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+        plt.savefig(f"5/E5_p_{p_values[-1]}_{dimension}_Backward.png")
+        plt.clf()
+
+
+        plt.semilogy(n, cholesky_times_reorderd, '-o', label="Cholesky reorderd")
+        plt.semilogy(n, forward_solve_times_reorderd, '-o', label="Forward Solve reorderd")
+        plt.semilogy(n, backward_solve_times_reorderd, '-o', label="Backward Solve reorderd")
+        plt.xlabel("N (Number of Elements)")
+        plt.ylabel("Time (s)")
+        plt.legend()
+        plt.savefig(f"5/E5_p_{p_values[-1]}_{dimension}.png")
+        plt.clf()
+
+
+    #################################
+    # Fill in ratio
+    #################################
+    if b:
+        if dimension == 2:
+            p_values = range(2, 11)
+        elif dimension == 3:
+            p_values = range(2, 9)
+        else:
+            print("Wrong Dimension")
+            return
+        
+        problem_size = []
+        fill_in_ratios = []
+        fill_in_ratios_reordered = []
+        for p in p_values:
+            n_elements = 2 * p - 1
+            
+            problem = Problem(n_elements, dimension)
+            fill_in_ratio = problem.fill_in_ratio()
+            fill_in_ratio_reordered = problem.fill_in_ratio(True)
+            problem_size.append(n_elements**dimension)
+            fill_in_ratios.append(fill_in_ratio)
+            fill_in_ratios_reordered.append(fill_in_ratio_reordered)
+
+
+
+        plt.plot(problem_size, fill_in_ratios, '-o')
+        plt.plot(problem_size, fill_in_ratios_reordered, '-o')
+        plt.legend(["Original", "Reordered"])
+        plt.xlabel("Problem Size N (Number of Elements)")
+        plt.ylabel("Fill-in Ratio")
+        plt.savefig(f"5/fillIn_p_{p_values[-1]}_{dimension}.png")
+        plt.clf()
+
+def E6():
+    p_values = range(6, 11)
+    for p in p_values:
+        n_elements = 2 * p - 1
+        problem = Problem(n_elements, 2)
+        u_h, residuals = Problem.ssor(problem)
+        plt.semilogy(residuals, label=f"p = {p}")
+
+    plt.xlabel("Iteration")
+    plt.ylabel("Residual")
+    plt.legend()
+    plt.savefig("6/E6.png")
+    plt.clf()
+
+def E7():
+    p_values = range(6, 11)
+    as_rate = []
+    for p in p_values:
+        n_elements = 2 * p - 1
+        problem = Problem(n_elements, 2)
+        u_h, residuals = Problem.ssor(problem)
+        as_rate.append(residuals[-5:])
+    print(np.array(as_rate).T)
+           
+def E8(dim=2):
+    if dim == 2:
+        p_values = range(6, 10)
+    elif dim == 3:
+        p_values = range(6, 15)
+    else:
+        print("Invalid dimension")
+    direct_times = []
+    ssor_times = []
+    N_vals = []
+    for p in p_values:
+        print(f"p = {p}")
+        n_elements = 2 * p - 1
+        N_vals = np.append(N_vals, n_elements**dim)
+        prob = Problem(n_elements, dim)
+        
+        # Time for direct solve
+        time_start = time.perf_counter()
+        direct_sol = spsolve(prob.matrix, prob.rhs)
+        time_direct_sol = time.perf_counter() - time_start
+
+        # Time for SSOR solve
+        time_start = time.perf_counter()
+        ssor_sol, ssor_res = prob.ssor()
+        time_ssor = time.perf_counter() - time_start
+
+        direct_times.append(time_direct_sol)
+        ssor_times.append(time_ssor)
+
+    #theo_time = [(ssor_times[0]/(len(ssor_res)*(2 * prob.matrix.nnz * N_vals[0] + N_vals[0])))*(len(ssor_res)*(2 * prob.matrix.nnz * n_v + n_v)) for n_v in N_vals]
+    theo_time = [(ssor_times[0]/(len(ssor_res)*(2 * N_vals[0]**2 + N_vals[0])))*(len(ssor_res)*(2 * n_v**2 + n_v)) for n_v in N_vals]
+
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(N_vals, direct_times, 'o-', label="Direct Solve", markersize=5, color='blue')
+    plt.semilogy(N_vals, ssor_times, 's-', label="SSOR", markersize=5, color='green')
+    plt.semilogy(N_vals, theo_time, 'd--', label="Theoretical Time", markersize=5, color='red')
+
+    plt.xlabel("N (Number of Elements)")
+    plt.ylabel("Time (seconds)")
+    plt.title("Comparison of Direct Solve and SSOR Times")
+    plt.legend()
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(f"8/E8_{dim}.png")
+
+"""The theoretical computation time for the SSOR is calculatred through the FLOPs per iteration times the number of iterations. We have two matrix vector products and two vector updates per iteration, resulting in a theoretical computation time of 2 * n*2 for the matrix * vector, (2cn, with c nnz for sparse matrices.) + 2n for the vector alloc (to fact check) """
+
+
+
+def E9():
+    p_values = range(8, 15)
+    plt.figure(figsize=(10, 6))  # Set the figure size
+
+    for p in p_values:
+        n_elements = 2 * p - 1
+        problem = Problem(n_elements, 2)
+        u_h, residuals = Problem.ssor(problem)
+        u_cg, residuals_cg = Problem.cg_with_ssor(problem)
+
+        plt.semilogy(residuals, label=f"SSOR, p = {p}", linestyle='-', marker='o', markersize=3, markevery=10)
+        plt.semilogy(residuals_cg, label=f"CG with SSOR, p = {p}", linestyle='--', marker='x', markersize=3, markevery=10)
+
+    plt.xlabel("Iteration")
+    plt.ylabel("Residual")
+    plt.title("Convergence of SSOR and CG with SSOR")
+    plt.legend()
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig("9/E9.png")
+    plt.clf()
+
+def E10(dim=2):
+    if dim == 2:
+        p_values = range(6, 10)
+    elif dim == 3:
+        p_values = range(6, 15)
+    else:
+        print("Invalid dimension")
+    direct_times = []
+    ssor_times = []
+    cg_times = []
+    N_vals = []
+    for p in p_values:
+        print(f"p = {p}")
+        n_elements = 2 * p - 1
+        N_vals = np.append(N_vals, n_elements**dim)
+        prob = Problem(n_elements, dim)
+        
+        # Time for direct solve
+        time_start = time.perf_counter()
+        direct_sol = spsolve(prob.matrix, prob.rhs)
+        time_direct_sol = time.perf_counter() - time_start
+
+        # Time for SSOR solve
+        time_start = time.perf_counter()
+        ssor_sol, ssor_res = prob.ssor()
+        time_ssor = time.perf_counter() - time_start
+
+        # Time for CG solve
+        time_start = time.perf_counter()
+        cg_sol = prob.cg_with_ssor()
+        time_cg = time.perf_counter() - time_start
+    
+
+        direct_times.append(time_direct_sol)
+        ssor_times.append(time_ssor)
+        cg_times.append(time_cg)
+
+    #theo_time = [(ssor_times[0]/(len(ssor_res)*(2 * prob.matrix.nnz * N_vals[0] + N_vals[0])))*(len(ssor_res)*(2 * prob.matrix.nnz * n_v + n_v)) for n_v in N_vals]
+
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(N_vals, direct_times, 'o-', label="Direct Solve", markersize=5, color='blue')
+    plt.semilogy(N_vals, ssor_times, 's-', label="SSOR", markersize=5, color='green')
+    plt.semilogy(N_vals, cg_times, 'd-', label="CG with SSOR", markersize=5, color='red')
+
+    plt.xlabel("N (Number of Elements)")
+    plt.ylabel("Time (seconds)")
+    plt.title("Comparison of Direct Solve and SSOR Times")
+    plt.legend()
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(f"10/E10_{dim}.png")
+
+
+
+#compare_methods()
+
 # E2(2)
 # E2(3)
 
-"""E3(2)
-E3(3)"""
+# E3(2)
+# E3(3)
 
 # E4(2)
 # E4(3)
@@ -464,11 +819,19 @@ E3(3)"""
 # E4(2, reorder=True)
 # E4(3, reorder=True)
 
+# E5(2, a=True, b=True)
+# E5(3, a=True, b=True)
+# E6()
+
+#E7()
+#E8(2)
+E9()
+#E10(2)
 
 
 #compare_methods()
 
-p = Problem(10,2)
+#p = Problem(10,2)
 
 # plt.spy(p.matrix, markersize=0.5)
 # plt.savefig("spaity_pattern_matrix.png")
