@@ -679,32 +679,88 @@ def E7():
            
 def E8(dim=2):
     if dim == 2:
-        p_values = range(6, 10)
+        p_values = range(6, 12)
     elif dim == 3:
         p_values = range(6, 15)
     else:
         print("Invalid dimension")
+    
+    ########################################
+    ## Time Stuff ##
+    #######################################
     direct_times = []
     ssor_times = []
+
+    ########################################
+    ## Iteration Stuff ##
+    #######################################
+
+    nr_iter_theoretical = []
+    ssor_iterations = []
+    ssor_res_list = [1]
+
+
     N_vals = []
     for p in p_values:
         print(f"p = {p}")
         n_elements = 2 * p - 1
+        #Create Instance
         N_vals = np.append(N_vals, n_elements**dim)
         prob = Problem(n_elements, dim)
-        
+
         # Time for direct solve
         time_start = time.perf_counter()
-        direct_sol = spsolve(prob.matrix, prob.rhs)
+        _ = spsolve(prob.matrix, prob.rhs)
         time_direct_sol = time.perf_counter() - time_start
+        direct_times.append(time_direct_sol)
 
         # Time for SSOR solve
         time_start = time.perf_counter()
-        ssor_sol, ssor_res = prob.ssor()
-        time_ssor = time.perf_counter() - time_start
+        _, ssor_res = prob.ssor()
+        ssor_res_list = np.append(ssor_res_list, ssor_res)
 
-        direct_times.append(time_direct_sol)
+        time_ssor = time.perf_counter() - time_start
         ssor_times.append(time_ssor)
+
+        #Iteration Stuff
+        omega = 1.5
+        AA = prob.matrix.todense()
+        A_upper = np.triu(AA, 1)
+        A_lower = np.tril(AA, -1)
+
+        C_Jac = np.identity(len(AA)) - np.linalg.inv(np.diag(np.diag(AA))) @ AA
+        mu = max(np.abs(np.linalg.eigvals(C_Jac)))
+        #print(f"mu = {mu}")
+        convergence_rate = 0.25 * (omega * mu + np.sqrt(omega **2 * mu**2 + 4 * (mu-1)))**2
+        # Calculate convergence rates (successive ratios)
+        convergence_rates = [ssor_res[i] / ssor_res[i-1] for i in range(1, len(ssor_res))]
+
+        # Compute the average convergence rate
+        average_convergence_rate = np.mean(convergence_rates)
+        print(f"Theo: {convergence_rate}, Measured: {average_convergence_rate}")
+
+
+
+
+        # omega = 1.5
+        # AA = prob.matrix.todense()
+        # exact_solution = spsolve(prob.matrix, prob.rhs)
+        # D = np.diag(np.diag(AA))
+        # E = - np.tril(AA, -1)
+        # F = - np.triu(AA, 1)
+        # M_SSOR = 1 / (omega * (2-omega)) * (D - omega * F) @ np.linalg.inv(D) @ (D - omega * E)
+        # eigenvalues = np.linalg.eigvals(M_SSOR)
+        # spec_rad = max(np.abs(eigenvalues))
+        # theo_nr_iterations = np.log10((np.linalg.norm(exact_solution)/10e-10))/np.log10(spec_rad.real)
+
+        
+        # ssor_iterations = np.append(ssor_iterations, len(ssor_res))
+
+
+        # # eigenvalues = np.linalg.eigvals(prob.matrix.todense())
+        # # condition_number = max(eigenvalues)/min(eigenvalues)
+        # # theo_nr_iterations = condition_number**(1/2) * np.log10(1/1e-10)
+        # nr_iter_theoretical = np.append(nr_iter_theoretical, theo_nr_iterations)
 
     #theo_time = [(ssor_times[0]/(len(ssor_res)*(2 * prob.matrix.nnz * N_vals[0] + N_vals[0])))*(len(ssor_res)*(2 * prob.matrix.nnz * n_v + n_v)) for n_v in N_vals]
     theo_time = [(ssor_times[0]/(len(ssor_res)*(2 * N_vals[0]**2 + N_vals[0])))*(len(ssor_res)*(2 * n_v**2 + n_v)) for n_v in N_vals]
@@ -720,14 +776,22 @@ def E8(dim=2):
     plt.legend()
     plt.grid(True, which="both", linestyle="--", linewidth=0.5)
     plt.tight_layout()
-    plt.savefig(f"8/E8_{dim}.png")
+    plt.savefig(f"8/E8_times_{dim}.png")
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(N_vals, ssor_iterations, 's-', label="SSOR", markersize=5, color='green')
+    plt.plot(N_vals, nr_iter_theoretical, 'd--', label="Theoretical Iterations", markersize=5, color='red')
 
-"""The theoretical computation time for the SSOR is calculatred through the FLOPs per iteration times the number of iterations. We have two matrix vector products and two vector updates per iteration, resulting in a theoretical computation time of 2 * n*2 for the matrix * vector, (2cn, with c nnz for sparse matrices.) + 2n for the vector alloc (to fact check) """
-
-
+    plt.xlabel("N (Number of Elements)")
+    plt.ylabel("Time (seconds)")
+    plt.title("Comparison of Direct Solve and SSOR Times")
+    plt.legend()
+    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(f"8/E8_iterations_{dim}.png")
 
 def E9():
-    p_values = range(8, 15)
+    p_values = range(10, 15)
     plt.figure(figsize=(10, 6))  # Set the figure size
 
     for p in p_values:
@@ -736,13 +800,19 @@ def E9():
         u_h, residuals = Problem.ssor(problem)
         u_cg, residuals_cg = Problem.cg_with_ssor(problem)
 
-        plt.semilogy(residuals, label=f"SSOR, p = {p}", linestyle='-', marker='o', markersize=3, markevery=10)
-        plt.semilogy(residuals_cg, label=f"CG with SSOR, p = {p}", linestyle='--', marker='x', markersize=3, markevery=10)
+        plt.semilogy(residuals, label=f"SSOR, p = {p}", linestyle='-', marker='o', markersize=3, markevery=5)
+        plt.semilogy(residuals_cg, label=f"CG w. SSOR, p = {p}", linestyle='--', marker='x', markersize=3, markevery=5)
 
     plt.xlabel("Iteration")
     plt.ylabel("Residual")
     plt.title("Convergence of SSOR and CG with SSOR")
-    plt.legend()
+
+    # Get handles and labels, then sort them
+    handles, labels = plt.gca().get_legend_handles_labels()
+    sorted_handles_labels = sorted(zip(labels, handles), key=lambda x: x[0])
+    sorted_labels, sorted_handles = zip(*sorted_handles_labels)
+
+    plt.legend(sorted_handles, sorted_labels)
     plt.grid(True, which="both", linestyle="--", linewidth=0.5)
     plt.tight_layout()
     plt.savefig("9/E9.png")
@@ -750,7 +820,7 @@ def E9():
 
 def E10(dim=2):
     if dim == 2:
-        p_values = range(6, 10)
+        p_values = range(6, 25)
     elif dim == 3:
         p_values = range(6, 15)
     else:
@@ -785,12 +855,19 @@ def E10(dim=2):
         ssor_times.append(time_ssor)
         cg_times.append(time_cg)
 
+    p_val_lower = 1
+    p_val_upper = 2
     #theo_time = [(ssor_times[0]/(len(ssor_res)*(2 * prob.matrix.nnz * N_vals[0] + N_vals[0])))*(len(ssor_res)*(2 * prob.matrix.nnz * n_v + n_v)) for n_v in N_vals]
+    theo_time_lower = [(cg_times[0]/(len(cg_times)*(2 * N_vals[0]**p_val_lower + N_vals[0])))*(len(cg_times)*(2 * n_v**p_val_lower + n_v)) for n_v in N_vals]
+    theo_time_upper = [(cg_times[0]/(len(cg_times)*(2 * N_vals[0]**p_val_upper + N_vals[0])))*(len(cg_times)*(2 * n_v**p_val_upper + n_v)) for n_v in N_vals]
 
     plt.figure(figsize=(10, 6))
     plt.semilogy(N_vals, direct_times, 'o-', label="Direct Solve", markersize=5, color='blue')
     plt.semilogy(N_vals, ssor_times, 's-', label="SSOR", markersize=5, color='green')
     plt.semilogy(N_vals, cg_times, 'd-', label="CG with SSOR", markersize=5, color='red')
+    plt.semilogy(N_vals, theo_time_lower, 'd--', label="Theo. Time lower bound", markersize=5)
+    plt.semilogy(N_vals, theo_time_upper, 'd--', label="Theo. Time upper bound", markersize=5)
+
 
     plt.xlabel("N (Number of Elements)")
     plt.ylabel("Time (seconds)")
@@ -799,7 +876,6 @@ def E10(dim=2):
     plt.grid(True, which="both", linestyle="--", linewidth=0.5)
     plt.tight_layout()
     plt.savefig(f"10/E10_{dim}.png")
-
 
 
 #compare_methods()
@@ -825,7 +901,7 @@ def E10(dim=2):
 
 #E7()
 #E8(2)
-E9()
+#E9()
 #E10(2)
 
 
